@@ -1,0 +1,182 @@
+---
+- hosts: localhost
+  vars_files: ./vars.yaml
+
+  tasks: 
+    - name: Create a Project folder
+      community.vmware.vcenter_folder:
+        hostname: '{{ vcenter_hostname }}'
+        username: '{{ vcenter_username }}'
+        password: '{{ vcenter_password }}'
+        datacenter: '{{ datacenter_name }}'
+        folder_name: '{{ project_id }}'
+        parent_folder: '{{ parent_folder }}'
+        state: present
+        validate_certs: no
+      register: vm_folder_creation_result
+      delegate_to: localhost
+
+---
+- hosts: localhost
+  vars_files: ./vars.yaml
+
+  tasks: 
+    - name: Create Project Standard Switch
+      community.vmware.vmware_vswitch:
+          hostname: '{{ esxi_hostname }}'
+          username: '{{ esxi_username }}'
+          password: '{{ esxi_password }}'
+          validate_certs: no
+          switch: '{{ project_id }}'
+      delegate_to: localhost
+
+---
+- hosts: localhost
+  vars_files: ./vars.yaml
+
+  tasks:
+    - name: Adding Openshift Portgroup
+      community.vmware.vmware_portgroup:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        esxi_hostname: "{{ esxi_hostname }}"
+        validate_certs: no
+        switch: "{{ project_id }}"
+        portgroup: "{{ private_net }}"
+      delegate_to: localhost
+    
+    - name: Adding Trunk Portgroup
+      community.vmware.vmware_portgroup:
+          hostname: "{{ vcenter_hostname }}"           # vCenter 서버의 호스트 이름 또는 IP 주소
+          username: "{{ vcenter_username }}"           # vCenter 서버에 인증할 사용자 이름
+          password: "{{ vcenter_password }}"           # vCenter 서버에 인증할 사용자 암호
+          esxi_hostname: "{{ esxi_hostname }}"         # ESXi 호스트 이름 또는 IP 주소
+          validate_certs: no                           # SSL/TLS 인증서 유효성 검사 비활성화
+          switch: "{{ student_ID }}"                   # 생성할 스위치 이름
+          portgroup: "{{ student_ID + '-Trunk' }}"     # 생성될 포트 그룹의 이름
+          vlan_id: 4095                                # 포트 그룹과 연결된 VLAN ID(모든 VLAN 허용 1~4094 -트렁크)
+          security:
+              promiscuous_mode: True                   # 모든 네트워크 트래픽 수신(네트워크, 패킷 분석)
+              mac_changes: True                        # MAC 주소 임의 변경 허용
+              forged_transmits: True                   # 위조된 MAC 주소로 패킷 송신 허용
+      delegate_to: localhost
+
+    - name: Adding Openshift Portgroup
+      community.vmware.vmware_portgroup:
+          hostname: "{{ vcenter_hostname }}"
+          username: "{{ vcenter_username }}"
+          password: "{{ vcenter_password }}"
+          esxi_hostname: "{{ esxi_hostname }}"
+          validate_certs: no
+          switch: "{{ student_ID }}"
+          portgroup: "{{ student_ID + '-Openshift' }}"
+          vlan_id: 10
+          security:
+              promiscuous_mode: True
+              mac_changes: True
+              forged_transmits: True
+      delegate_to: localhost
+
+---
+- hosts: localhost
+  vars_files: ./vars.yaml
+
+  tasks:
+    - name: Create a Router VM
+      community.vmware.vmware_guest:
+        hostname: "{{ vcenter_hostname }}"
+        username: "{{ vcenter_username }}"
+        password: "{{ vcenter_password }}"
+        
+        datacenter: "{{ datacenter_name }}"
+        folder: "{{ folder_prefix + project_id }}"
+        esxi_hostname: "{{ esxi_hostname }}"
+
+        name: "{{ project_id + '-Router2' }}"
+        state: poweredon
+        guest_id: otherLinux64Guest
+        validate_certs: no
+
+        disk:
+        - size_gb: 2
+          type: thin
+          datastore: "{{ datastore_name }}"
+        hardware:
+          num_cpus: 1
+          memory_mb: 1024
+        networks:
+        - name: '{{ public_net }}'
+          device_type: vmxnet3
+        - name: '{{ private_net }}'
+          device_type: vmxnet3
+        cdrom:
+        - controller_number: 0
+          unit_number: 0
+          state: present
+          type: iso
+          iso_path: "[ESXi-05] ISO/vyos-rolling-latest.iso"
+      delegate_to: localhost
+      register: deploy_vm
+
+  ---
+- hosts: localhost
+  vars_files: ./vars.yaml
+
+  tasks:
+    - name: VyOS Router Configuration
+      community.vmware.vmware_vm_shell:
+        hostname: '{{ vcenter_hostname }}'
+        username: '{{ vcenter_username }}'
+        password: '{{ vcenter_password }}'
+        datacenter: '{{ datacenter_name }}'
+        folder: '{{ folder_prefix + project_id }}'
+        validate_certs: no
+        
+        vm_id: "{{ project_id + '-VYOS' }}"
+        vm_id_type: vm_name
+        vm_username: 'vyos'
+        vm_password: 'vyos'
+        vm_shell: /bin/vbash
+        vm_shell_cwd: "/tmp"
+        vm_shell_args: |-
+          -c "source /opt/vyatta/etc/functions/script-template
+          configure
+          set system login user admin full-name Admin_User
+          set system login user admin authentication plaintext-password VMware1!
+          set service ssh port 22
+            
+          set system ipv6 disable
+          
+          set interfaces ethernet eth0 address dhcp
+          set interfaces ethernet eth0 description Outside
+          set interfaces ethernet eth0 ipv6 address no-default-link-local
+          set protocols static route 0.0.0.0/0 next-hop 192.168.3.1
+
+          set interfaces ethernet eth1 vif 10 description 'VLAN 10 - Openshift'
+          set interfaces ethernet eth1 vif 10 address 10.10.10.1/24
+          set interfaces ethernet eth1 ipv6 address no-default-link-local
+
+          set nat source rule 10 outbound-interface eth0
+          set nat source rule 10 source address 10.10.10.0/24
+          set nat source rule 10 translation address masquerade
+          
+          set system name-server 192.168.3.3
+          set system ntp server kr.pool.ntp.org
+                      
+          set nat source rule 10 outbound-interface eth0
+          set nat source rule 10 source address 10.10.10.0/24
+          set nat source rule 10 translation address masquerade
+
+          set service dhcp-server shared-network-name Openshift subnet 10.10.10.0/24 default-router '10.10.10.1'
+          set service dhcp-server shared-network-name Openshift subnet 10.10.10.0/24 name-server '10.10.10.2'
+          set service dhcp-server shared-network-name Openshift subnet 10.10.10.0/24 domain-name 'vclass.local'
+          set service dhcp-server shared-network-name Openshift subnet 10.10.10.0/24 range 0 start '10.10.10.100'
+          set service dhcp-server shared-network-name Openshift subnet 10.10.10.0/24 range 0 stop '10.10.10.200'
+           
+          commit
+          save"
+        wait_for_process: True
+        timeout: 180
+      delegate_to: localhost
+      register: shell_command_with_wait_timeout
